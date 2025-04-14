@@ -1,0 +1,136 @@
+name: Helm
+
+on:
+  pull_request:
+    branches:
+      - master
+      - release-*
+    paths:
+      - helm-chart/kuberay-apiserver/Chart.yaml
+      - helm-chart/kuberay-operator/Chart.yaml
+      - helm-chart/ray-cluster/Chart.yaml
+  push:
+    branches:
+      - master
+      - release-*
+    paths:
+      - helm-chart/kuberay-apiserver/Chart.yaml
+      - helm-chart/kuberay-operator/Chart.yaml
+      - helm-chart/ray-cluster/Chart.yaml
+
+env:
+  KUBERAY_HELM_REPOSITORY: ${{ github.repository_owner }}/kuberay-helm
+  HELM_CHART_PATH: helm-chart
+
+jobs:
+  sync-charts:
+    name: Sync Charts
+
+    permissions:
+      contents: write
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        chart_name:
+          - kuberay-apiserver
+          - kuberay-operator
+          - ray-cluster
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          path: ${{ github.repository }}
+          fetch-depth: 0
+
+      - name: Get Branch Name
+        id: branch_name
+        run: |
+          BRANCH=""
+          if [ "${{ github.event_name }}" == "push" ]; then
+            BRANCH=${{ github.ref_name }}
+          elif [ "${{ github.event_name }}" == "pull_request" ]; then
+            BRANCH=${{ github.base_ref }}
+          fi
+
+          # The default branch name of kuberay-helm repo is "main",
+          # but the default branch name of kuberay repo is "master".
+          if [ "$BRANCH" == "master" ]; then
+            BRANCH="main"
+          fi
+          echo "BRANCH=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Check Current Chart Version
+        id: current_chart_version
+        working-directory: ${{ github.repository }}
+        env:
+          BRANCH: ${{ steps.get_branch.outputs.BRANCH }}
+        run: |
+          CURRENT_VERSION=$(cat ${{ env.HELM_CHART_PATH }}/${{ matrix.chart_name }}/Chart.yaml | grep 'version:' | awk '{print $2}')
+          echo "CURRENT_VERSION=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout kuberay-helm Repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KUBERAY_HELM_REPOSITORY }}
+          ref: ${{ steps.branch_name.outputs.BRANCH }}
+          path: ${{ env.KUBERAY_HELM_REPOSITORY }}
+          fetch-depth: 0
+
+      - name: Check Previous Chart Version
+        id: previous_chart_version
+        working-directory: ${{ env.KUBERAY_HELM_REPOSITORY }}
+        run: |
+          PREVIOUS_VERSION=$(cat ${{ env.HELM_CHART_PATH }}/${{ matrix.chart_name }}/Chart.yaml | grep 'version:' | awk '{print $2}')
+          echo "PREVIOUS_VERSION=$PREVIOUS_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check Version Bump
+        id: check_version_bump
+        env:
+          CURRENT_VERSION: ${{ steps.current_chart_version.outputs.CURRENT_VERSION }}
+          PREVIOUS_VERSION: ${{ steps.previous_chart_version.outputs.PREVIOUS_VERSION }}
+        run: |
+          if [ "${CURRENT_VERSION}" != "${PREVIOUS_VERSION}}" ]; then
+            echo "VERSION_BUMP=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "VERSION_BUMP=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure Git
+        if: ${{ steps.check_version_bump.outputs.VERSION_BUMP == 'true' }}
+        working-directory: ${{ env.KUBERAY_HELM_REPOSITORY }}
+        run: |
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: Make Code Changes
+        if: ${{ steps.check_version_bump.outputs.VERSION_BUMP == 'true' }}
+        env:
+          CURRENT_VERSION: ${{ steps.check_version_bump.outputs.CURRENT_VERSION }}
+          PREVIOUS_VERSION: ${{ steps.check_version_bump.outputs.PREVIOUS_VERSION }}
+        run: |
+          rm -r ${{ env.KUBERAY_HELM_REPOSITORY }}/${{ env.HELM_CHART_PATH }}/${{ matrix.chart_name }}
+          cp -r ${{ github.repository }}/${{ env.HELM_CHART_PATH }}/${{ matrix.chart_name }} ${{ env.KUBERAY_HELM_REPOSITORY }}/${{ env.HELM_CHART_PATH }}
+
+      - name: Create Pull Request
+        if: ${{ steps.check_version_bump.outputs.VERSION_BUMP == 'true' }}
+        uses: peter-evans/create-pull-request@v7
+        env:
+          CURRENT_VERSION: ${{ steps.check_version_bump.outputs.CURRENT_VERSION }}
+          PREVIOUS_VERSION: ${{ steps.check_version_bump.outputs.PREVIOUS_VERSION }}
+        with:
+          path: ${{ env.KUBERAY_HELM_REPOSITORY }}
+          committer: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+          author: ${{ github.actor }} <${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com>
+          signoff: false
+          branch: helm/${{ matrix.chart_name }}-${{ env.CURRENT_VERSION }}
+          commit-message: "Bump ${{ matrix.chart_name }} from ${{ env.PREVIOUS_VERSION }} to ${{ env.CURRENT_VERSION }}"
+          title: "Bump ${{ matrix.chart_name }} from ${{ env.PREVIOUS_VERSION }} to ${{ env.CURRENT_VERSION }}"
+          body: |
+            ## Proposed changes
+
+            - Bump ${{ matrix.chart_name }} from `${{ env.PREVIOUS_VERSION }}` to `${{ env.CURRENT_VERSION }}`
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: false
